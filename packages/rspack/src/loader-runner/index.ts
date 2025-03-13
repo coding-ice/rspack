@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * The following code is modified based on
  * https://github.com/webpack/loader-runner
@@ -10,6 +11,7 @@
 
 import querystring from "node:querystring";
 
+import path from "node:path";
 import assert from "node:assert";
 import { promisify } from "node:util";
 import {
@@ -56,6 +58,10 @@ import {
 } from "../util/identifier";
 import { memoize } from "../util/memoize";
 import loadLoader from "./loadLoader";
+import { MessageChannel } from "node:worker_threads";
+import { convertArgs } from "./utils";
+//
+MessageChannel
 
 function createLoaderObject(
 	loader: JsLoaderItem,
@@ -97,8 +103,8 @@ function createLoaderObject(
 				if (ident === "[[missing ident]]") {
 					throw new Error(
 						"No ident is provided by referenced loader. " +
-							"When using a function for Rule.use in config you need to " +
-							"provide an 'ident' property for referenced loader options."
+						"When using a function for Rule.use in config you need to " +
+						"provide an 'ident' property for referenced loader options."
 					);
 				}
 				obj.options = compiler.__internal__ruleSet.references.get(ident);
@@ -343,10 +349,10 @@ function getCurrentLoader(
 // FIXME: a temporary fix, we may need to change @rspack/tracing to commonjs really fix it
 let cachedTracing:
 	| {
-			trace: TraceAPI;
-			propagation: PropagationAPI;
-			context: ContextAPI;
-	  }
+		trace: TraceAPI;
+		propagation: PropagationAPI;
+		context: ContextAPI;
+	}
 	| null
 	| undefined;
 
@@ -390,6 +396,32 @@ async function tryTrace(context: JsLoaderContext) {
 		return { trace, tracer, activeContext };
 	}
 	return null;
+}
+
+let pool: any;
+
+const createPool = async () => {
+	if (pool) {
+		console.log(pool)
+		return pool
+	}
+	return import("tinypool").then(({ Tinypool }) => {
+		const cpus = require("os").cpus().length;
+
+		const availableThreads = Math.max(cpus - 1, 1);
+
+		pool = new Tinypool({
+			filename: path.resolve(__dirname, "loaderRunnerWorker.js"),
+			useAtomics: false,
+
+			maxThreads: availableThreads,
+			minThreads: availableThreads,
+			concurrentTasksPerWorker: 1,
+
+		})
+		// console.log(pool)
+		return pool
+	})
 }
 
 export async function runLoaders(
@@ -491,7 +523,7 @@ export async function runLoaders(
 					if (res.error) {
 						onError(
 							compiler.__internal__getModuleExecutionResult(res.id) ??
-								new Error(err)
+							new Error(err)
 						);
 					} else {
 						onDone(compiler.__internal__getModuleExecutionResult(res.id));
@@ -910,25 +942,74 @@ export async function runLoaders(
 						continue;
 					}
 
-					await loadLoaderAsync(currentLoaderObject);
-					const fn = currentLoaderObject.normal;
-					currentLoaderObject.normalExecuted = true;
-					if (!fn) continue;
-					const args = [content, sourceMap, additionalData];
-					convertArgs(args, !!currentLoaderObject.raw);
 
-					const span = tracer?.startSpan(
-						"LoaderRunner:normal",
-						{
-							attributes: {
-								"loader.identifier": getCurrentLoader(loaderContext)?.request
-							}
-						},
-						activeContext
-					);
-					[content, sourceMap, additionalData] =
-						(await runSyncOrAsync(fn, loaderContext, args)) || [];
-					span?.end();
+
+					if (process.env.RSPACK_LOADER_WORKER) {
+
+
+						const span = tracer?.startSpan(
+							"LoaderRunner:normal",
+							{
+								attributes: {
+									"loader.identifier": getCurrentLoader(loaderContext)?.request
+								}
+							},
+							activeContext
+						); const { port1: tx, port2: rx } = new MessageChannel();
+						let result: any;
+						try {
+
+							result = await (await createPool()).run({
+								loaderObject: currentLoaderObject,
+								tx,
+								args: [content, sourceMap, additionalData]
+							},
+								{
+									transferList: [tx]
+								}).then(() => {
+									return new Promise((resolve, reject) => {
+										rx.on("message", (message) => {
+											// console.log("message", message)
+											resolve(message)
+										})
+										rx.on("close", () => {
+											resolve(null)
+										})
+										rx.on("error", reject)
+									})
+								})
+
+						} catch (e) {
+							console.log("error", e)
+
+						}
+
+						;[content, sourceMap, additionalData] = result.newArgs || [];
+						currentLoaderObject.normalExecuted = true;
+						span?.end();
+
+					} else {
+						await loadLoaderAsync(currentLoaderObject);
+						const fn = currentLoaderObject.normal;
+						currentLoaderObject.normalExecuted = true;
+						if (!fn) continue;
+						const args = [content, sourceMap, additionalData];
+						convertArgs(args, !!currentLoaderObject.raw);
+						const span = tracer?.startSpan(
+							"LoaderRunner:normal",
+							{
+								attributes: {
+									"loader.identifier": getCurrentLoader(loaderContext)?.request
+								}
+							},
+							activeContext
+						);
+
+						;[content, sourceMap, additionalData] =
+							(await runSyncOrAsync(fn, loaderContext, args)) || [];
+						span?.end();
+					}
+
 				}
 
 				context.content = isNil(content) ? null : toBuffer(content);
@@ -950,35 +1031,23 @@ export async function runLoaders(
 		context.__internal__error =
 			typeof e === "string"
 				? {
-						name: "ModuleBuildError",
-						message: e
-					}
+					name: "ModuleBuildError",
+					message: e
+				}
 				: {
-						name: "ModuleBuildError",
-						message: error.message,
-						stack: typeof error.stack === "string" ? error.stack : undefined,
-						hideStack:
-							"hideStack" in error
-								? error.hideStack === true || error.hideStack === "true"
-								: undefined
-					};
+					name: "ModuleBuildError",
+					message: error.message,
+					stack: typeof error.stack === "string" ? error.stack : undefined,
+					hideStack:
+						"hideStack" in error
+							? error.hideStack === true || error.hideStack === "true"
+							: undefined
+				};
 	}
 	return context;
 }
 
-function utf8BufferToString(buf: Buffer) {
-	const str = buf.toString("utf-8");
-	if (str.charCodeAt(0) === 0xfeff) {
-		return str.slice(1);
-	}
-	return str;
-}
 
-function convertArgs(args: any[], raw: boolean) {
-	if (!raw && Buffer.isBuffer(args[0])) args[0] = utf8BufferToString(args[0]);
-	else if (raw && typeof args[0] === "string")
-		args[0] = Buffer.from(args[0], "utf-8");
-}
 
 const PATH_QUERY_FRAGMENT_REGEXP =
 	/^((?:\u200b.|[^?#\u200b])*)(\?(?:\u200b.|[^#\u200b])*)?(#.*)?$/;
